@@ -1,0 +1,11 @@
+{
+    "cortex-debug.openocdPath": "/home/victor/opt/openocd-0.12.0/bin/openocd",
+    "cortex-debug.armToolchainPath": "/usr/lib/ccache",
+    "files.associations": {
+        "*.pef": "xml",
+        "stm32c0xx_hal_uart.h": "c",
+        "main.h": "c",
+        "stm32c0xx_hal.h": "c",
+        "stm32c0xx_hal_conf.h": "c"
+    }
+}

@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "STM32",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "defines": [
+                "USE_HAL_DRIVER",
+                "STM32C011xx"
+            ],
+            "compilerPath": "/usr/lib/ccache/arm-none-eabi-gcc",
+            "intelliSenseMode": "gcc-arm",
+            "compilerArgs": [
+                "-mcpu=cortex-m0",
+                "-mthumb"
+            ],
+            "cStandard": "c11"
+        }
+    ],
+    "version": 4
+}

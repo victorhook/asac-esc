@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "cwd": "${workspaceFolder}",
+            "executable": "./build/asac-esc.elf",
+            "name": "Debug with ST-Link",
+            "request": "launch",
+            "type": "cortex-debug",
+            "runToEntryPoint": "main",
+            "servertype": "openocd",
+            "serverpath": "/home/victor/opt/openocd-0.12.0/bin/openocd",
+            "device": "STM32C011xx",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32c0x.cfg"
+            ]
+        }
+    ]
+}

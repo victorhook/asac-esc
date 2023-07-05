@@ -1,0 +1,3 @@
+*kicad/*/*backups/*.zip
+*-cache
+build/
