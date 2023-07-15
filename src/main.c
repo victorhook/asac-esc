@@ -1,24 +1,5 @@
-#include "main.h"
-#include "machine.h"
-
-
-ADC_HandleTypeDef hadc1;
-
-TIM_HandleTypeDef htim1;
-TIM_HandleTypeDef htim3;
-
-UART_HandleTypeDef huart2;
-
-
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_ADC1_Init(void);
-static void MX_TIM1_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_USART2_UART_Init(void);
-
-
-static void blink_boot_up_sequence();
+#include "asac_esc.h"
+#include "hal.h"
 
 
 #define LED_BLUE_HIGH() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_SET)
@@ -26,46 +7,261 @@ static void blink_boot_up_sequence();
 #define LED_RED_HIGH() HAL_GPIO_WritePin(PORT_LED_BLUE, PIN_LED_BLUE, GPIO_PIN_SET)
 #define LED_RED_LOW() HAL_GPIO_WritePin(PORT_LED_BLUE, PIN_LED_BLUE, GPIO_PIN_RESET)
 
+// Slowest allowed signal is 50 Hz,
+#define NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US (20000 + 3000) // Add some margin
 
-int main(void)
+#define MIN_THROTTLE 0
+#define MAX_THROTTLE 2048
+#define MIN_PULSE_LENGTH_US 20
+#define MAX_PULSE_LENGTH_US 2500
+
+// Callbacks
+void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin);
+void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin);
+
+static void blink_boot_up_sequence();
+static inline void update();
+static inline void arm();
+static inline void disarm();
+static inline float pulse_length_to_throttle(const uint32_t time_since_last_pulse);
+static inline void handle_bldc_output();
+//static inline void set_pwm_duty_cycle(TIM_TypeDef* TIMx, const uint32_t duty);
+static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, const uint8_t shift_mask);
+
+
+
+static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
 {
-  HAL_Init();
+    // Close LIN -> Set NLIN HIGH (Active low)
+    nlin_port->BSRR = nlin_pin;
+    // Set PWM on HIN to throttle value
+    *pwm_comp_reg = state.throttle;
+}
 
-  SystemClock_Config();
+static inline void phase_low(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
+{
+    // Open LIN -> Set NLIN LOW (Active low)
+    nlin_port->BRR = nlin_pin;
+    // Set PWM on HIN to 0
+    *pwm_comp_reg = 0;
+}
 
-  MX_GPIO_Init();
-  MX_ADC1_Init();
+static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
+{
+    // Close LIN -> Set NLIN LOW (Active low)
+    nlin_port->BSRR = nlin_pin;
+    // Set PWM on HIN to 0
+    *pwm_comp_reg = 0;
 
-
-  UART_HandleTypeDef uart_handle;
-  uart_handle.Instance = USART2;
-  uart_handle.Init.BaudRate = 115200;
-  uart_handle.Init.WordLength = UART_WORDLENGTH_8B;
-  uart_handle.Init.StopBits = UART_STOPBITS_1;
-  uart_handle.Init.Parity = UART_PARITY_NONE;
-  uart_handle.Init.Mode = UART_MODE_TX_RX;
-  uart_handle.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  //uart_handle.Init.OverSampling = UART_OVERSAMPLING_16;
-  //uart_handle.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  //uart_handle.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  HAL_UART_Init(&uart_handle);
-
-  GPIO_InitTypeDef gp = {0};
-
-  blink_boot_up_sequence();
-
-  LED_RED_LOW();
-  LED_BLUE_HIGH();
-
-  while (1)
-  {
-    const char* msg = "hello world\n";
-    HAL_UART_Transmit(&uart_handle, msg, strlen(msg), 0);
-    HAL_Delay(1000);
-  }
+    //set_gpio_mode
+    // HIN_C_MODER_SHIFT_MASK
 }
 
 
+#define phase_a_high()  phase_high( &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
+#define phase_a_low()   phase_low(  &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
+#define phase_a_input() phase_input(&PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
+#define phase_b_high()  phase_high( &PWM_REG_HIN_B, PORT_LIN_B, PIN_LIN_B)
+#define phase_b_low()   phase_low(  &PWM_REG_HIN_B, PORT_LIN_B, PIN_LIN_B)
+#define phase_b_input() phase_input(&PWM_REG_HIN_B, PORT_LIN_B, PIN_LIN_B)
+#define phase_c_high()  phase_high( &PWM_REG_HIN_C, PORT_LIN_C, PIN_LIN_C)
+#define phase_c_low()   phase_low(  &PWM_REG_HIN_C, PORT_LIN_C, PIN_LIN_C)
+#define phase_c_input() phase_input(&PWM_REG_HIN_C, PORT_LIN_C, PIN_LIN_C)
+
+
+static uint32_t _micros = 0;
+uint32_t time_since_last_transition_us;
+
+
+int main(void)
+{
+    hal_init();
+
+    blink_boot_up_sequence();
+    LED_RED_LOW();
+    LED_BLUE_HIGH();
+
+
+    while (1)
+    {
+        update();
+        continue;
+    }
+}
+
+
+static inline void update()
+{
+    // If the timer 14 (that handles micro seconds timing) reaches above a
+    // certain value, we'll
+    const UPPER_VALUE = 30000;
+    if (TIM14->CNT > UPPER_VALUE)
+    {
+        _micros += (TIM14->CNT);
+        TIM14->CNT = 0;
+    }
+
+    static uint32_t t0 = 0;
+
+    uint32_t now = micros();
+    uint32_t time_since_last_pulse = now - state.signal_last_low_us;
+    float throttle = pulse_length_to_throttle(state.signal_last_pulse_length_us);
+
+    if ((now - t0) > 1000000)
+    {
+        printf("[Mode: %d] Pulse: %lu, throttle: %d\n", state.mode, state.signal_last_pulse_length_us, (int) throttle);
+        t0 = micros();
+    }
+
+    state_mode_t next_mode;
+    uint32_t transition_delay_us = 5000;
+
+
+    if ((state.signal_last_pulse_length_us < MIN_PULSE_LENGTH_US) ||
+        (state.signal_last_pulse_length_us > MAX_PULSE_LENGTH_US) ||
+        (time_since_last_pulse > NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US))
+    {
+        next_mode = MODE_IDLE;
+    }
+    else
+    {
+        state.throttle = throttle;
+
+        next_mode = MODE_RUNNING;
+    }
+
+    switch (state.mode)
+    {
+        case MODE_IDLE:
+            if (next_mode == MODE_RUNNING)
+            {
+                arm();
+            }
+            break;
+        case MODE_RUNNING:
+            if (next_mode == MODE_IDLE)
+            {
+                disarm();
+            }
+            else
+            {
+                time_since_last_transition_us = micros() - state.last_bldc_state_transition;
+                if ((time_since_last_transition_us) > transition_delay_us)
+                {
+                    handle_bldc_output();
+                    state.last_bldc_state_transition = micros();
+                }
+            }
+            break;
+    }
+
+    // Transition to next mode
+    state.mode = next_mode;
+}
+
+static inline void set_pwm_duty_cycle(TIM_TypeDef* TIMx, const uint8_t channel, const uint32_t duty)
+{
+    // 1. Stop PWM
+    //TIMx->CCER &= ~TIM_CCER_CC1E;
+
+    // 2. Set the Capture Compare Register value
+    TIMx->CCR1 = duty;
+
+    // 3. Start PWM
+    //TIMx->CCER |= TIM_CCER_CC1E;
+}
+
+static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, const uint8_t shift_mask)
+{
+    // To switch between pin mode, eg OUTPUT/INPUT/Alternate function, we
+    // set the correct bits in the MODER register:
+    // 00: Input
+    // 01: Output
+    // 10: Alternate function
+    // 11: Analog
+
+    // First we'll clear the two bits corresponding to the specific pin
+    gpio_port->MODER &= ~(0b11 << shift_mask);
+    // Set bits
+    gpio_port->MODER |=  (mode << shift_mask);
+}
+
+static inline void arm()
+{
+    LED_RED_HIGH();
+}
+static inline void disarm()
+{
+    LED_RED_LOW();
+    phase_a_low();
+    phase_b_low();
+    phase_c_low();
+}
+
+static inline void handle_bldc_output()
+{
+    /*
+        State   A   B   C
+          1     1   0   Z
+          2     1   Z   0
+          3     Z   1   0
+          4     0   1   Z
+          5     0   Z   1
+          6     Z   0   1
+    */
+    switch (state.bldc_state)
+    {
+        case BLDC_STATE_1:
+            phase_b_low();
+            phase_a_high();
+            phase_c_input();
+            state.bldc_state = BLDC_STATE_2;
+            break;
+        case BLDC_STATE_2:
+            phase_c_low();
+            phase_a_high();
+            phase_b_input();
+            state.bldc_state = BLDC_STATE_3;
+            break;
+        case BLDC_STATE_3:
+            phase_a_input();
+            phase_b_high();
+            phase_c_low();
+            state.bldc_state = BLDC_STATE_4;
+            break;
+        case BLDC_STATE_4:
+            phase_a_low();
+            phase_b_high();
+            phase_c_input();
+            state.bldc_state = BLDC_STATE_5;
+            break;
+        case BLDC_STATE_5:
+            phase_a_low();
+            phase_b_input();
+            phase_c_high();
+            state.bldc_state = BLDC_STATE_6;
+            break;
+        case BLDC_STATE_6:
+            phase_a_input();
+            phase_b_low();
+            phase_c_high();
+            state.bldc_state = BLDC_STATE_1;
+            break;
+    }
+}
+
+static inline float pulse_length_to_throttle(const uint32_t pulse_us)
+{
+    int min = 1000;
+    int max = 2000;
+    int diff_min_max = (max - min);
+
+    float throttle = constrain(pulse_us, min, max);
+    throttle = (throttle - min) / diff_min_max;
+
+    // Assumption: Normal PWM, 50 Hz
+    return throttle * MAX_THROTTLE;
+}
 
 static void blink_boot_up_sequence()
 {
@@ -81,356 +277,36 @@ static void blink_boot_up_sequence()
 
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV4;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
-  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief ADC1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC1_Init(void)
-{
-
-  /* USER CODE BEGIN ADC1_Init 0 */
-
-  /* USER CODE END ADC1_Init 0 */
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN ADC1_Init 1 */
-
-  /* USER CODE END ADC1_Init 1 */
-
-  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
-  */
-  hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV1;
-  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-  hadc1.Init.LowPowerAutoWait = DISABLE;
-  hadc1.Init.LowPowerAutoPowerOff = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_1CYCLE_5;
-  hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_1CYCLE_5;
-  hadc1.Init.OversamplingMode = DISABLE;
-  hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_12;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN ADC1_Init 2 */
-
-  /* USER CODE END ADC1_Init 2 */
-
-}
-
-/**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 0;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 65535;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.BreakFilter = 0;
-  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
-  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
-  sBreakDeadTimeConfig.Break2Filter = 0;
-  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
-
-}
-
-/**
-  * @brief TIM3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM3_Init(void)
-{
-
-  /* USER CODE BEGIN TIM3_Init 0 */
-
-  /* USER CODE END TIM3_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM3_Init 1 */
-
-  /* USER CODE END TIM3_Init 1 */
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 65535;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_OC_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM3_Init 2 */
-
-  /* USER CODE END TIM3_Init 2 */
-  HAL_TIM_MspPostInit(&htim3);
-
-}
-
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2|GPIO_PIN_5, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : PA2 PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
-}
-
-/* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
+  LED_BLUE_LOW();
   while (1)
   {
+    LED_RED_HIGH();
+    HAL_Delay(500);
+    LED_RED_LOW();
+    HAL_Delay(500);
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
-#ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
+void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
+    state.signal_last_high_us = micros();
 }
-#endif /* USE_FULL_ASSERT */
+void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
+{
+    state.signal_last_low_us = micros();
+    state.signal_last_pulse_length_us = state.signal_last_low_us - state.signal_last_high_us;
+}
+
+uint32_t micros()
+{
+  return _micros + (TIM14->CNT);
+}
+
+uint32_t millis()
+{
+  return micros() * 1000;
+}

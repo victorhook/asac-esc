@@ -6,6 +6,9 @@
         "stm32c0xx_hal_uart.h": "c",
         "main.h": "c",
         "stm32c0xx_hal.h": "c",
-        "stm32c0xx_hal_conf.h": "c"
+        "stm32c0xx_hal_conf.h": "c",
+        "stdio.h": "c",
+        "core_cm0plus.h": "c",
+        "state.h": "c"
     }
 }

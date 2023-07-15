@@ -5,11 +5,14 @@ OPENOCD_INTERFACE = interface/stlink.cfg
 
 DEBUG = 1
 OPT = -Og
+#OPT = -O3
 
 BUILD_DIR = build
 
 C_SOURCES =  \
 src/main.c \
+src/hal.c \
+src/state.c \
 src/stm32c0xx_it.c \
 src/stm32c0xx_hal_msp.c \
 drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal.c \
@@ -27,6 +30,8 @@ drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_pwr_ex.c \
 drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_cortex.c \
 drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_uart.c \
 drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_exti.c \
+drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_tim.c \
+drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_tim_ex.c \
 src/system_stm32c0xx.c
 
 # ASM sources
@@ -53,6 +58,9 @@ SZ = $(PREFIX)size
 endif
 HEX = $(CP) -O ihex
 BIN = $(CP) -O binary -S
+
+
+OBJDUMP = $(PREFIX)objdump
 
 #######################################
 # CFLAGS
@@ -158,6 +166,8 @@ $(BUILD_DIR):
 flash: all
 	${OPENOCD} -f ${OPENOCD_INTERFACE} -f ${OPENOCD_TARGET} -c "program ${BUILD_DIR}/${TARGET}.elf verify reset exit"
 
+disasm:
+	${OBJDUMP} $(BUILD_DIR)/$(TARGET).elf -D > DISASM
 
 clean:
 	-rm -fR $(BUILD_DIR)
