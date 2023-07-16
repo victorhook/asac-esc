@@ -2,6 +2,7 @@
 #define STATE_H
 
 #include "stdint.h"
+#include "stdbool.h"
 
 
 typedef enum
@@ -27,8 +28,10 @@ typedef struct
     uint32_t     signal_last_high_us;
     uint32_t     signal_last_pulse_length_us;
     bldc_state_t bldc_state;
+    bool         bemf_rising;
     uint32_t     last_bldc_state_transition;
     float        throttle;
+    uint32_t     input_adc_channel;
 } state_t;
 
 extern state_t state;

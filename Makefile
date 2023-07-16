@@ -4,7 +4,7 @@ OPENOCD_TARGET = target/stm32c0x.cfg
 OPENOCD_INTERFACE = interface/stlink.cfg
 
 DEBUG = 1
-OPT = -Og
+OPT = -O0
 #OPT = -O3
 
 BUILD_DIR = build

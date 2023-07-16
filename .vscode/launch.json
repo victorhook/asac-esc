@@ -17,6 +17,24 @@
                 "enabled": true,
                 "samplesPerSecond": 4
             }
+        },
+        {
+            "cwd": "${workspaceFolder}/CUBEMX_GENERATE",
+            "executable": "./build/CUBEMX_GENERATE.elf",
+            "name": "Debug CubeMX Project",
+            "request": "launch",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "serverpath": "/home/victor/opt/openocd-0.12.0/bin/openocd",
+            "device": "STM32C011xx",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32c0x.cfg"
+            ],
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            }
         }
     ]
 }
