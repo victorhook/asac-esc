@@ -22,10 +22,14 @@ static void blink_boot_up_sequence();
 static inline void update();
 static inline void arm();
 static inline void disarm();
-static inline float pulse_length_to_throttle(const uint32_t time_since_last_pulse);
-static inline void handle_bldc_output();
+static inline uint16_t pulse_length_to_throttle(const uint32_t time_since_last_pulse);
+static inline void commutate();
 //static inline void set_pwm_duty_cycle(TIM_TypeDef* TIMx, const uint32_t duty);
 static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, const uint8_t shift_mask);
+
+static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
+static inline void phase_low(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
+static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin, uint32_t adc_channel);
 
 
 typedef enum
@@ -40,48 +44,17 @@ commutation_mode_t commutation_mode = COMMUTATION_OPEN_LOOP;
 uint32_t open_loop_commutation_steps = 0;
 uint32_t max_open_loop_commutation_steps = 500;
 float open_loop_delay_us = 5000;
-uint32_t open_loop_delay_us_min = 250;
+uint32_t open_loop_delay_us_min = 750;
 uint32_t pulse_errors = 0;
 
+#define MINIMUM_PULSE_LENGTH_US 1000
+#define MAXIMUM_PULSE_LENGTH_US 2000
+#define MAX_THROTTLE_DUTY_VALUE 2048
+#define PULSE_LENGTH_TO_THROTTLE_FACTOR ((1.0 / (float) MINIMUM_PULSE_LENGTH_US) * MAX_THROTTLE_DUTY_VALUE)
 
+static uint32_t adc_filter[5];
 
-
-
-static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
-{
-    // Close LIN -> Set NLIN HIGH (Active low)
-    nlin_port->BSRR = nlin_pin;
-    // Set PWM on HIN to throttle value
-    *pwm_comp_reg = state.throttle;
-}
-
-static inline void phase_low(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
-{
-    // Open LIN -> Set NLIN LOW (Active low)
-    nlin_port->BRR = nlin_pin;
-    // Set PWM on HIN to 0
-    *pwm_comp_reg = 0;
-}
-
-static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin, uint32_t adc_channel)
-{
-    // Close LIN -> Set NLIN LOW (Active low)
-    nlin_port->BSRR = nlin_pin;
-    // Set PWM on HIN to 0
-    *pwm_comp_reg = 0;
-
-    // Select phase A as ADC channel.
-    // TODO: Quicker implementation with direct register manipulation.
-    ADC_ChannelConfTypeDef sConfig = {
-        .Channel = adc_channel,
-        .Rank = ADC_REGULAR_RANK_1,
-        .SamplingTime = ADC_SAMPLINGTIME_COMMON_1
-    };
-    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-
-    state.input_adc_channel = adc_channel;
-}
-
+//#define DO_DEBUG
 
 #define phase_a_high()  phase_high( &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
 #define phase_a_low()   phase_low(  &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
@@ -110,35 +83,29 @@ int main()
 
     disarm();
 
-    phase_a_input();
-    phase_b_input();
-    phase_c_input();
-
     HAL_ADCEx_Calibration_Start(&hadc1);
     uint32_t calib = HAL_ADCEx_Calibration_GetValue(&hadc1);
 
+    // Enable ADC
+    ADC1->ISR |= ADC_ISR_ADRDY;
+    ADC1->CR |= ADC_CR_ADEN;
+    while (!(ADC1->ISR & ADC_ISR_ADRDY));
+
+    // Set ADC as continous
+    ADC1->CFGR1 |= ADC_CFGR1_CONT;
+    ADC1->CFGR1 &= ~ADC_CFGR1_CHSELRMOD;
+
+    // Start!
+    ADC1->CR |= ADC_CR_ADSTART;
+
     while (1)
     {
-        /*
-        phase_a_input();
-        HAL_ADC_Start(&hadc1);
-        HAL_StatusTypeDef res = HAL_ADC_PollForConversion(&hadc1, 10);
-        if (res != HAL_OK)
-        {
-            printf("ADC ERR\n");
-        }
-        else
-        {
-            uint32_t raw = HAL_ADC_GetValue(&hadc1);
-            // Voltage divider:
-            // R1 = 4700
-            // R2 = 1000
-            // Gain = 1 / (R1 / (R1 + R2)) = 1 / (1000 (4700 + 1000)) = 5.7
-            float voltage = 3.3 * ((float) raw / 4095.0) * 5.7;
-            printf("A:%u, %d\n", raw, (int) (voltage*1000));
-        }
-        */
+        //while (!(ADC1->ISR & ADC_ISR_EOC));
+        //printf("%d\n", ADC1->DR);
+        //uint32_t t0 = micros();
         update();
+        //uint32_t t1 = micros();
+        //uint32_t dt = t1 - t0;
     }
 }
 
@@ -157,32 +124,36 @@ static inline void update()
     static uint32_t t0 = 0;
 
     uint32_t now = micros();
-    int time_since_last_pulse = now - state.signal_last_low_us;
-    float throttle = pulse_length_to_throttle(state.signal_last_pulse_length_us);
+    long time_since_last_pulse = now - state.signal_last_ok_pulse;
+    uint16_t throttle = pulse_length_to_throttle(state.signal_last_pulse_length_us);
 
+    #ifdef DO_DEBUG
     if ((now - t0) > 1000000)
     {
-        //printf("[Mode: %d] Pulse: %lu, throttle: %d, low: %u, high: %u, zc: %u, cMode: %d, S: %u\n",
-        //       state.mode, state.signal_last_pulse_length_us, (int) throttle,
-        //       lowest_adc_value, highest_adc_value, zero_crossing_point,
-        //       commutation_mode, open_loop_commutation_steps
-        //       );
+        printf("[Mode: %d] Pulse: %lu, throttle: %u, low: %u, high: %u, zc: %u, cMode: %d, S: %u, D: %u\n",
+               state.mode, state.signal_last_pulse_length_us, throttle,
+               lowest_adc_value, highest_adc_value, zero_crossing_point,
+               commutation_mode, open_loop_commutation_steps,
+               state.last_commutation_duration_us
+               );
         t0 = micros();
     }
+    #endif
 
     state_mode_t next_mode;
-    uint32_t transition_delay_us = 5000;
+    uint32_t transition_delay_us;
 
-
-    if (time_since_last_pulse > NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US)
-    {   // Disconnect?
-        next_mode = MODE_IDLE;
-    }
-    else
+    if ((state.signal_last_ok_pulse > 0) && (time_since_last_pulse < NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US))
     {
         state.throttle = throttle;
         next_mode = MODE_RUNNING;
     }
+    else
+    {
+        next_mode = MODE_IDLE;
+    }
+
+
 
     switch (state.mode)
     {
@@ -203,22 +174,49 @@ static inline void update()
                 {   // If throttle is zero, we'll set commutation to open loop again
                     commutation_mode = COMMUTATION_OPEN_LOOP;
                     open_loop_commutation_steps = 0;
+                    phase_a_low();
+                    phase_b_low();
+                    phase_c_low();
                 }
                 else
                 {
+                    // Read ADC
+                    while (!(ADC1->ISR & ADC_ISR_EOC));
+                    uint32_t raw = ADC1->DR;
+
+                    // Filter ADC
+                    const int FILTER_ORDER = 5;
+                    for (int i = FILTER_ORDER-1; i > 0; i--)
+                    {
+                        adc_filter[i] = adc_filter[i-1];
+                    }
+                    adc_filter[0] = raw;
+
+                    uint32_t adc_value = 0;
+                    for (int i = 0; i < FILTER_ORDER; i++)
+                    {
+                        adc_value += adc_filter[i];
+                    }
+                    adc_value /= FILTER_ORDER;
+                    raw = adc_value;
+
+
+                    if (raw > highest_adc_value)
+                    {
+                        highest_adc_value = raw;
+                    }
 
                     // -- Open loop commutation -- //
                     if (commutation_mode == COMMUTATION_OPEN_LOOP)
                     {
                         transition_delay_us = open_loop_delay_us;
                         state.throttle = 1000;
-                        open_loop_delay_us -= .1;
+                        open_loop_delay_us -= .25;
 
-
-                        time_since_last_transition_us = micros() - state.last_bldc_state_transition;
+                        time_since_last_transition_us = micros() - state.last_commutation;
                         if ((time_since_last_transition_us) > transition_delay_us)
                         {
-                            handle_bldc_output();
+                            commutate();
                             open_loop_commutation_steps++;
                         }
 
@@ -232,72 +230,35 @@ static inline void update()
                     }
                     else
                     {   // -- Closed loop commutation -- //
-                        HAL_ADC_Start(&hadc1);
-                        HAL_StatusTypeDef res = HAL_ADC_PollForConversion(&hadc1, 10);
-                        if (res != HAL_OK)
-                        {
-                            printf("ADC ERR\n");
-                        }
-                        else
-                        {
-                            uint32_t raw = HAL_ADC_GetValue(&hadc1);
-                            if (raw < lowest_adc_value)
-                            {
-                                lowest_adc_value = raw;
-                            }
-                            if (raw > highest_adc_value)
-                            {
-                                highest_adc_value = raw;
-                            }
+                        uint32_t now = micros();
 
-                            const uint32_t MAX_EXPECTED_ADC_DIFF = 4095;
-                            uint32_t adc_diff = highest_adc_value - lowest_adc_value;
-                            if (adc_diff > MAX_EXPECTED_ADC_DIFF)
-                            {   // WHAT TO DO?
-                            }
-                            else
-                            {
-                                zero_crossing_point = adc_diff / 2;
-                            }
-
-                            // TODO: Remove
-                            //zero_crossing_point = 400;
+                        //if (now >= state.next_commutation)
+                        //{
+                        //    commutate();
+                        //}
+                        //else
+                        {
+                            //zero_crossing_point = highest_adc_value / 2;
 
                             if (state.bemf_rising)
                             {
                                 if (raw > zero_crossing_point)
                                 {
-                                    handle_bldc_output();
+                                    commutate();
+                                    //state.next_commutation = now;// + (state.last_commutation_duration_us / 2);
                                 }
                             }
                             else
                             {
                                 if (raw < zero_crossing_point)
                                 {
-                                    handle_bldc_output();
+                                    commutate();
+                                    //state.next_commutation = now;// + (state.last_commutation_duration_us / 2);
+
                                 }
                             }
-                            // Voltage divider:
-                            // R1 = 4700
-                            // R2 = 1000
-                            // Gain = 1 / (R1 / (R1 + R2)) = 1 / (1000 (4700 + 1000)) = 5.7
-                            /*
-
-                            float voltage = ((float) raw / 4095.0) * 5.7;
-                            switch (state.input_adc_channel)
-                            {
-                                case ADC_CHANNEL_PHASE_A:
-                                    printf("A:%u, %d\n", raw, (int) (voltage*1000));
-                                    break;
-                                case ADC_CHANNEL_PHASE_B:
-                                    //printf("B:%d,", raw);
-                                    break;
-                                case ADC_CHANNEL_PHASE_C:
-                                    //printf("C:%d\n", raw);
-                                    break;
-                            }
-                            */
                         }
+
                     }
                 }
             }
@@ -308,7 +269,7 @@ static inline void update()
     state.mode = next_mode;
 }
 
-static inline void handle_bldc_output()
+static inline void commutate()
 {
     /*
         State   A   B   C
@@ -326,6 +287,8 @@ static inline void handle_bldc_output()
             phase_a_high();
             phase_c_input();
             state.bemf_rising = false;
+            zero_crossing_point = highest_adc_value / 2;
+            highest_adc_value = 0;
             state.bldc_state = BLDC_STATE_2;
             break;
         case BLDC_STATE_2:
@@ -340,6 +303,8 @@ static inline void handle_bldc_output()
             phase_b_high();
             phase_c_low();
             state.bemf_rising = false;
+            zero_crossing_point = highest_adc_value / 2;
+            highest_adc_value = 0;
             state.bldc_state = BLDC_STATE_4;
             break;
         case BLDC_STATE_4:
@@ -354,29 +319,79 @@ static inline void handle_bldc_output()
             phase_b_input();
             phase_c_high();
             state.bemf_rising = false;
+            zero_crossing_point = highest_adc_value / 2;
+            highest_adc_value = 0;
             state.bldc_state = BLDC_STATE_6;
             break;
         case BLDC_STATE_6:
             phase_a_input();
             phase_b_low();
             phase_c_high();
-            state.bemf_rising = false;
+            state.bemf_rising = true;
             state.bldc_state = BLDC_STATE_1;
             break;
     }
 
-    // Reset zero crossing variables
-    lowest_adc_value  = 0xFFFFFFFF;
-    highest_adc_value = 0;
-
     // Update time since last transition
-    state.last_bldc_state_transition = micros();
+    uint32_t now = micros();
+    state.last_commutation_duration_us = now - state.last_commutation;
+    // Fallback?
+    //state.next_commutation = now + state.last_commutation_duration_us;
+    state.last_commutation = now;
 }
+
+static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
+{
+    // Close LIN -> Set NLIN HIGH (Active low)
+    nlin_port->BSRR = nlin_pin;
+    // Set PWM on HIN to throttle value
+    *pwm_comp_reg = state.throttle;
+}
+
+static inline void phase_low(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
+{
+    // Open LIN -> Set NLIN LOW (Active low)
+    nlin_port->BRR = nlin_pin;
+    // Set PWM on HIN to 0
+    *pwm_comp_reg = 0;
+}
+
+static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin, uint32_t adc_channel)
+{
+    // Close LIN -> Set NLIN LOW (Active low)
+    nlin_port->BSRR = nlin_pin;
+    // Set PWM on HIN to 0
+    *pwm_comp_reg = 0;
+
+    // Select phase A as ADC channel.
+    // TODO: Quicker implementation with direct register manipulation.
+    /*
+    ADC_ChannelConfTypeDef sConfig = {
+        .Channel = adc_channel,
+        .Rank = ADC_REGULAR_RANK_1,
+        .SamplingTime = ADC_SAMPLINGTIME_COMMON_1
+    };
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    */
+
+    // Stop ADC
+    ADC1->CR &= ~ADC_CR_ADSTART;
+    // Set channel
+    ADC1->CHSELR = adc_channel;
+    // Wait for channel selection to be set
+    while (!(ADC1->ISR & ADC_ISR_CCRDY));
+    // Start ADC again
+    ADC1->CR |= ADC_CR_ADSTART;
+
+    state.input_adc_channel = adc_channel;
+}
+
 
 static inline void arm()
 {
     commutation_mode = COMMUTATION_OPEN_LOOP;
     LED_RED_HIGH();
+    printf("[%u] ARM\n", millis());
 }
 static inline void disarm()
 {
@@ -385,19 +400,29 @@ static inline void disarm()
     phase_a_low();
     phase_b_low();
     phase_c_low();
+    printf("[%u] DISARM\n", millis());
 }
 
-static inline float pulse_length_to_throttle(const uint32_t pulse_us)
+static inline uint16_t pulse_length_to_throttle(const uint32_t pulse_us)
 {
-    int min = 1000;
-    int max = 2000;
-    int diff_min_max = (max - min);
+    float throttle;
 
-    float throttle = constrain(pulse_us, min, max);
-    throttle = (throttle - min) / diff_min_max;
+    if (pulse_us < MINIMUM_PULSE_LENGTH_US)
+    {
+        throttle = MINIMUM_PULSE_LENGTH_US;
+    }
+    else if (pulse_us > MAXIMUM_PULSE_LENGTH_US)
+    {
+        throttle = MAXIMUM_PULSE_LENGTH_US;
+    }
+    else
+    {
+        throttle = pulse_us;
+    }
 
-    // Assumption: Normal PWM, 50 Hz
-    return throttle * MAX_THROTTLE;
+    throttle -= MINIMUM_PULSE_LENGTH_US;
+
+    return (uint16_t) (throttle * PULSE_LENGTH_TO_THROTTLE_FACTOR);
 }
 
 static void blink_boot_up_sequence()
@@ -453,10 +478,12 @@ void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
 
     uint32_t signal_last_pulse_length_us = state.signal_last_low_us - state.signal_last_high_us;
 
-    if ((signal_last_pulse_length_us >= MIN_PULSE_LENGTH_US) && 
+    if ((signal_last_pulse_length_us >= MIN_PULSE_LENGTH_US) &&
         (signal_last_pulse_length_us <= MAX_PULSE_LENGTH_US))
     {   // Ensure signal pulse length is valid
         state.signal_last_pulse_length_us = signal_last_pulse_length_us;
+        // Save timestamp of las received OK signal
+        state.signal_last_ok_pulse = state.signal_last_low_us;
     }
     else
     {

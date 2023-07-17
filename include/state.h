@@ -27,9 +27,12 @@ typedef struct
     uint32_t     signal_last_low_us;
     uint32_t     signal_last_high_us;
     uint32_t     signal_last_pulse_length_us;
+    uint32_t     signal_last_ok_pulse;
     bldc_state_t bldc_state;
     bool         bemf_rising;
-    uint32_t     last_bldc_state_transition;
+    uint32_t     last_commutation;
+    uint32_t     next_commutation;
+    uint32_t     last_commutation_duration_us;
     float        throttle;
     uint32_t     input_adc_channel;
 } state_t;

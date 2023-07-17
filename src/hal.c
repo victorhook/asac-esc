@@ -11,6 +11,7 @@ TIM_HandleTypeDef htim14;
 
 void SystemClock_Config();
 static void timer14_init();
+static void timer16_init();
 static void nvic_interrupt_init();
 static void uart2_init();
 static void adc_init();
@@ -44,6 +45,7 @@ void hal_init()
     __HAL_RCC_TIM1_CLK_ENABLE();
     __HAL_RCC_TIM3_CLK_ENABLE();
     __HAL_RCC_TIM14_CLK_ENABLE();
+    __HAL_RCC_TIM16_CLK_ENABLE();
 
     init_pwm_timer(&htim1, TIM1);
     init_pwm_timer(&htim3, TIM3);
@@ -62,6 +64,7 @@ void hal_init()
 
     gpios_init();
     timer14_init();
+    //timer16_init();
     adc_init();
     nvic_interrupt_init();
     uart2_init();
@@ -208,6 +211,25 @@ static void timer14_init()
     //HAL_NVIC_EnableIRQ(TIM14_IRQn);
 }
 
+static void timer16_init()
+{
+    htim14.Instance = TIM16;
+    htim14.Init.Prescaler = 2;
+    htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim14.Init.Period = 0xFFFF;
+    htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+    {
+    Error_Handler();
+    }
+    TIM14->CR1 &= ~TIM_CR1_UDIS;
+    if (HAL_TIM_Base_Start(&htim14) != HAL_OK)
+    {
+      Error_Handler();
+    }
+}
+
 static void adc_init()
 {
     ADC_ChannelConfTypeDef sConfig = {0};
@@ -229,8 +251,8 @@ static void adc_init()
     hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
     hadc1.Init.DMAContinuousRequests = DISABLE;
     hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-    hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_1CYCLE_5;
-    hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_1CYCLE_5;
+    hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_160CYCLES_5;
+    hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_160CYCLES_5;
     hadc1.Init.OversamplingMode = DISABLE;
     hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
     if (HAL_ADC_Init(&hadc1) != HAL_OK)
