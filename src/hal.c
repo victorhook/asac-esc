@@ -280,7 +280,17 @@ static void adc_init()
         Error_Handler();
     }
 
+      // Enable ADC
+    ADC1->ISR |= ADC_ISR_ADRDY;
+    ADC1->CR |= ADC_CR_ADEN;
+    while (!(ADC1->ISR & ADC_ISR_ADRDY));
 
+    // Set ADC as continuous
+    ADC1->CFGR1 |= ADC_CFGR1_CONT;
+    ADC1->CFGR1 &= ~ADC_CFGR1_CHSELRMOD;
+
+    // Start!
+    ADC1->CR |= ADC_CR_ADSTART;
 }
 
 static void nvic_interrupt_init()

@@ -1,6 +1,24 @@
 #include "asac_esc.h"
 #include "hal.h"
 
+// Callbacks
+void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin);
+void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin);
+
+static void blink_boot_up_sequence();
+static inline void update();
+static uint32_t read_bemf();
+static inline void arm();
+static inline void disarm();
+static inline uint16_t pulse_length_to_throttle(const uint32_t time_since_last_pulse);
+static inline void commutate();
+static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, const uint8_t shift_mask);
+
+static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
+static inline void phase_low(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
+static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin, uint32_t adc_channel);
+
+
 #define LED_BLUE_HIGH() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_SET)
 #define LED_BLUE_LOW() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_RESET)
 #define LED_RED_HIGH() HAL_GPIO_WritePin(PORT_LED_BLUE, PIN_LED_BLUE, GPIO_PIN_SET)
@@ -9,52 +27,13 @@
 // Slowest allowed signal is 50 Hz,
 #define NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US (20000 + 3000) // Add some margin
 
-#define MIN_THROTTLE 0
-#define MAX_THROTTLE 2048
 #define MIN_PULSE_LENGTH_US 20
 #define MAX_PULSE_LENGTH_US 2500
-
-// Callbacks
-void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin);
-void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin);
-
-static void blink_boot_up_sequence();
-static inline void update();
-static inline void arm();
-static inline void disarm();
-static inline uint16_t pulse_length_to_throttle(const uint32_t time_since_last_pulse);
-static inline void commutate();
-//static inline void set_pwm_duty_cycle(TIM_TypeDef* TIMx, const uint32_t duty);
-static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, const uint8_t shift_mask);
-
-static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
-static inline void phase_low(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
-static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin, uint32_t adc_channel);
-
-
-typedef enum
-{
-    COMMUTATION_OPEN_LOOP   = 0,
-    COMMUTATION_CLOSED_LOOP = 1
-} commutation_mode_t;
-uint32_t lowest_adc_value  = 0xFFFFFFFF;
-uint32_t highest_adc_value = 0;
-uint32_t zero_crossing_point = 0;
-commutation_mode_t commutation_mode = COMMUTATION_OPEN_LOOP;
-uint32_t open_loop_commutation_steps = 0;
-uint32_t max_open_loop_commutation_steps = 500;
-float open_loop_delay_us = 5000;
-uint32_t open_loop_delay_us_min = 750;
-uint32_t pulse_errors = 0;
 
 #define MINIMUM_PULSE_LENGTH_US 1000
 #define MAXIMUM_PULSE_LENGTH_US 2000
 #define MAX_THROTTLE_DUTY_VALUE 2048
 #define PULSE_LENGTH_TO_THROTTLE_FACTOR ((1.0 / (float) MINIMUM_PULSE_LENGTH_US) * MAX_THROTTLE_DUTY_VALUE)
-
-static uint32_t adc_filter[5];
-
-//#define DO_DEBUG
 
 #define phase_a_high()  phase_high( &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
 #define phase_a_low()   phase_low(  &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
@@ -67,8 +46,7 @@ static uint32_t adc_filter[5];
 #define phase_c_input() phase_input(&PWM_REG_HIN_C, PORT_LIN_C, PIN_LIN_C, ADC_CHANNEL_PHASE_C)
 
 
-static uint32_t _micros = 0;
-uint32_t time_since_last_transition_us;
+//#define DO_DEBUG
 
 
 int main()
@@ -84,19 +62,6 @@ int main()
     disarm();
 
     HAL_ADCEx_Calibration_Start(&hadc1);
-    uint32_t calib = HAL_ADCEx_Calibration_GetValue(&hadc1);
-
-    // Enable ADC
-    ADC1->ISR |= ADC_ISR_ADRDY;
-    ADC1->CR |= ADC_CR_ADEN;
-    while (!(ADC1->ISR & ADC_ISR_ADRDY));
-
-    // Set ADC as continous
-    ADC1->CFGR1 |= ADC_CFGR1_CONT;
-    ADC1->CFGR1 &= ~ADC_CFGR1_CHSELRMOD;
-
-    // Start!
-    ADC1->CR |= ADC_CR_ADSTART;
 
     while (1)
     {
@@ -114,20 +79,25 @@ static inline void update()
 {
     // If the timer 14 (that handles micro seconds timing) reaches above a
     // certain value, we'll
-    const UPPER_VALUE = 30000;
+    const uint32_t UPPER_VALUE = 30000;
     if (TIM14->CNT > UPPER_VALUE)
     {
-        _micros += (TIM14->CNT);
+        state._micros += (TIM14->CNT);
         TIM14->CNT = 0;
     }
 
-    static uint32_t t0 = 0;
 
     uint32_t now = micros();
+
+    if (state.signal_pulse_length_us != state.signal_last_pulse_length_us)
+    {   // New pulse received, calculate throttle
+        state.throttle = pulse_length_to_throttle(state.signal_last_pulse_length_us);
+    }
+
     long time_since_last_pulse = now - state.signal_last_ok_pulse;
-    uint16_t throttle = pulse_length_to_throttle(state.signal_last_pulse_length_us);
 
     #ifdef DO_DEBUG
+    static uint32_t t0 = 0;
     if ((now - t0) > 1000000)
     {
         printf("[Mode: %d] Pulse: %lu, throttle: %u, low: %u, high: %u, zc: %u, cMode: %d, S: %u, D: %u\n",
@@ -141,19 +111,15 @@ static inline void update()
     #endif
 
     state_mode_t next_mode;
-    uint32_t transition_delay_us;
 
     if ((state.signal_last_ok_pulse > 0) && (time_since_last_pulse < NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US))
     {
-        state.throttle = throttle;
         next_mode = MODE_RUNNING;
     }
     else
     {
         next_mode = MODE_IDLE;
     }
-
-
 
     switch (state.mode)
     {
@@ -172,93 +138,102 @@ static inline void update()
             {
                 if (state.throttle == 0)
                 {   // If throttle is zero, we'll set commutation to open loop again
-                    commutation_mode = COMMUTATION_OPEN_LOOP;
-                    open_loop_commutation_steps = 0;
+                    state.commutation_mode = COMMUTATION_OPEN_LOOP;
+                    state.open_loop_commutations = 0;
+                    state.open_loop_commutation_period_us = OPEN_LOOP_START_COMMUTATION_TIME_US;
+                    state.open_loop_throttle = 500;
                     phase_a_low();
                     phase_b_low();
                     phase_c_low();
                 }
                 else
                 {
-                    // Read ADC
-                    while (!(ADC1->ISR & ADC_ISR_EOC));
-                    uint32_t raw = ADC1->DR;
+                    uint32_t adc_value = read_bemf();
 
-                    // Filter ADC
-                    const int FILTER_ORDER = 5;
-                    for (int i = FILTER_ORDER-1; i > 0; i--)
+                    if (adc_value > state.highest_adc_value)
                     {
-                        adc_filter[i] = adc_filter[i-1];
+                        state.highest_adc_value = adc_value;
                     }
-                    adc_filter[0] = raw;
 
-                    uint32_t adc_value = 0;
-                    for (int i = 0; i < FILTER_ORDER; i++)
-                    {
-                        adc_value += adc_filter[i];
-                    }
-                    adc_value /= FILTER_ORDER;
-                    raw = adc_value;
-
-
-                    if (raw > highest_adc_value)
-                    {
-                        highest_adc_value = raw;
-                    }
+                    uint32_t now;
 
                     // -- Open loop commutation -- //
-                    if (commutation_mode == COMMUTATION_OPEN_LOOP)
-                    {
-                        transition_delay_us = open_loop_delay_us;
-                        state.throttle = 1000;
-                        open_loop_delay_us -= .25;
 
-                        time_since_last_transition_us = micros() - state.last_commutation;
-                        if ((time_since_last_transition_us) > transition_delay_us)
+                    if (state.commutation_mode == COMMUTATION_OPEN_LOOP)
+                    {
+                        state.throttle = state.open_loop_throttle;
+
+                        if (state.open_loop_commutation_period_us > 1600)
                         {
-                            commutate();
-                            open_loop_commutation_steps++;
+                            state.open_loop_commutation_period_us -= 2;
                         }
 
-                        //if (open_loop_commutation_steps > max_open_loop_commutation_steps)
-                        if (open_loop_delay_us < open_loop_delay_us_min)
+                        now = micros();
+
+                        // Check if we've done enough commutations in open-loop
+                        // mode and if we've detected a zero cross that seems
+                        // to be reasonable.
+                        if ( (state.open_loop_commutations > 200) &&
+                            (
+                            ((state.bemf_rising)  && (adc_value > state.zero_crossing_point)) ||
+                            ((!state.bemf_rising) && (adc_value < state.zero_crossing_point)))
+                           )
                         {
-                            commutation_mode = COMMUTATION_CLOSED_LOOP;
-                            open_loop_commutation_steps = 0;
-                            open_loop_delay_us = 5000;
+                            // Zero cross detected. Let's check that the time is reasonable
+                            uint32_t expected_next_commutation = state.last_commutation + (state.last_commutation_duration_us / 2);
+
+                            const int offset_limit = 100;
+                            bool zero_cross_detected;
+
+                            int dt = now - expected_next_commutation;
+                            if (dt < 0)
+                            {
+                                zero_cross_detected = dt > (-1 * offset_limit);
+                            }
+                            else
+                            {
+                                zero_cross_detected = dt < offset_limit;
+                            }
+
+                            if (zero_cross_detected)
+                            {   // Detected zero cross in closed-loop!
+                                // Let's switch to open-loop control instead
+                                state.commutation_mode = COMMUTATION_CLOSED_LOOP;
+                            }
+                        }
+
+                        if (!state.next_commutation_time_set)
+                        {   // We'll set the next commutation to pre-decided time
+                            state.next_commutation = now + state.open_loop_commutation_period_us;
+                            state.next_commutation_time_set = true;
+                            state.open_loop_commutations++;
                         }
                     }
                     else
                     {   // -- Closed loop commutation -- //
-                        uint32_t now = micros();
+                        now = micros();
 
-                        //if (now >= state.next_commutation)
-                        //{
-                        //    commutate();
-                        //}
-                        //else
+                        // https://dspguru.com/dsp/faqs/fir/properties/
+                        // Phase delay of filter: (N – 1) / (2 * Fs) = (5 - 1) / (2 * 60000) ≃ 33us
+                        static const uint32_t phase_delay_us = 33;
+
+
+                        if ( (!state.next_commutation_time_set) &&
+                            (((state.bemf_rising)  && (adc_value > state.zero_crossing_point)) ||
+                            ((!state.bemf_rising) &&  (adc_value < state.zero_crossing_point))))
                         {
-                            //zero_crossing_point = highest_adc_value / 2;
-
-                            if (state.bemf_rising)
-                            {
-                                if (raw > zero_crossing_point)
-                                {
-                                    commutate();
-                                    //state.next_commutation = now;// + (state.last_commutation_duration_us / 2);
-                                }
-                            }
-                            else
-                            {
-                                if (raw < zero_crossing_point)
-                                {
-                                    commutate();
-                                    //state.next_commutation = now;// + (state.last_commutation_duration_us / 2);
-
-                                }
-                            }
+                            state.next_commutation = now + (state.last_commutation_duration_us / 2) - phase_delay_us;
+                            state.next_commutation_time_set = true;
                         }
 
+                    }
+
+                    if (state.next_commutation_time_set)
+                    {
+                        if (now >= state.next_commutation)
+                        {
+                            commutate();
+                        }
                     }
                 }
             }
@@ -287,8 +262,8 @@ static inline void commutate()
             phase_a_high();
             phase_c_input();
             state.bemf_rising = false;
-            zero_crossing_point = highest_adc_value / 2;
-            highest_adc_value = 0;
+            state.zero_crossing_point = state.highest_adc_value / 2;
+            state.highest_adc_value = 0;
             state.bldc_state = BLDC_STATE_2;
             break;
         case BLDC_STATE_2:
@@ -303,8 +278,8 @@ static inline void commutate()
             phase_b_high();
             phase_c_low();
             state.bemf_rising = false;
-            zero_crossing_point = highest_adc_value / 2;
-            highest_adc_value = 0;
+            state.zero_crossing_point = state.highest_adc_value / 2;
+            state.highest_adc_value = 0;
             state.bldc_state = BLDC_STATE_4;
             break;
         case BLDC_STATE_4:
@@ -319,8 +294,8 @@ static inline void commutate()
             phase_b_input();
             phase_c_high();
             state.bemf_rising = false;
-            zero_crossing_point = highest_adc_value / 2;
-            highest_adc_value = 0;
+            state.zero_crossing_point = state.highest_adc_value / 2;
+            state.highest_adc_value = 0;
             state.bldc_state = BLDC_STATE_6;
             break;
         case BLDC_STATE_6:
@@ -337,7 +312,29 @@ static inline void commutate()
     state.last_commutation_duration_us = now - state.last_commutation;
     // Fallback?
     //state.next_commutation = now + state.last_commutation_duration_us;
+    state.next_commutation_time_set = false;
     state.last_commutation = now;
+}
+
+static uint32_t read_bemf()
+{
+    while (!(ADC1->ISR & ADC_ISR_EOC));
+    uint32_t raw = ADC1->DR;
+
+    // Filter ADC
+    for (int i = state.bemf_adc_filter_order-1; i > 0; i--)
+    {
+        state.bemf_adc_filter[i] = state.bemf_adc_filter[i-1];
+    }
+    state.bemf_adc_filter[0] = raw;
+
+    uint32_t adc_value = 0;
+    for (int i = 0; i < state.bemf_adc_filter_order; i++)
+    {
+        adc_value += state.bemf_adc_filter[i];
+    }
+
+    return adc_value / state.bemf_adc_filter_order;
 }
 
 static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin)
@@ -389,18 +386,19 @@ static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_p
 
 static inline void arm()
 {
-    commutation_mode = COMMUTATION_OPEN_LOOP;
+    state.commutation_mode = COMMUTATION_OPEN_LOOP;
+    state.open_loop_commutation_period_us = OPEN_LOOP_START_COMMUTATION_TIME_US;
     LED_RED_HIGH();
-    printf("[%u] ARM\n", millis());
+    printf("[%lu] ARM\n", millis());
 }
 static inline void disarm()
 {
-    commutation_mode = COMMUTATION_OPEN_LOOP;
+    state.commutation_mode = COMMUTATION_OPEN_LOOP;
     LED_RED_LOW();
     phase_a_low();
     phase_b_low();
     phase_c_low();
-    printf("[%u] DISARM\n", millis());
+    printf("[%lu] DISARM\n", millis());
 }
 
 static inline uint16_t pulse_length_to_throttle(const uint32_t pulse_us)
@@ -476,24 +474,27 @@ void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
 {
     state.signal_last_low_us = micros();
 
-    uint32_t signal_last_pulse_length_us = state.signal_last_low_us - state.signal_last_high_us;
+    uint32_t signal_pulse_length_us = state.signal_last_low_us - state.signal_last_high_us;
 
-    if ((signal_last_pulse_length_us >= MIN_PULSE_LENGTH_US) &&
-        (signal_last_pulse_length_us <= MAX_PULSE_LENGTH_US))
-    {   // Ensure signal pulse length is valid
-        state.signal_last_pulse_length_us = signal_last_pulse_length_us;
+    if ((signal_pulse_length_us >= MIN_PULSE_LENGTH_US) &&
+        (signal_pulse_length_us <= MAX_PULSE_LENGTH_US))
+    {
+        // Set last signal pulse length to current one
+        state.signal_last_pulse_length_us = state.signal_pulse_length_us;
+        // Ensure signal pulse length is valid
+        state.signal_pulse_length_us = signal_pulse_length_us;
         // Save timestamp of las received OK signal
         state.signal_last_ok_pulse = state.signal_last_low_us;
     }
     else
     {
-        pulse_errors++;
+        state.pulse_errors++;
     }
 }
 
 uint32_t micros()
 {
-  return _micros + (TIM14->CNT);
+  return state._micros + (TIM14->CNT);
 }
 
 uint32_t millis()

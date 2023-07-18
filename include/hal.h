@@ -5,10 +5,10 @@
 #include "stm32c0xx_hal.h"
 
 
-#define GPIO_MODE_INPUT              0b00
-#define GPIO_MODE_OUTPUT             0b01
-#define GPIO_MODE_ALTERNATE_FUNCTION 0b10
-#define GPIO_MODE_ANALOG             0b11
+//#define GPIO_MODE_INPUT              0b00
+//#define GPIO_MODE_OUTPUT             0b01
+//#define GPIO_MODE_ALTERNATE_FUNCTION 0b10
+//#define GPIO_MODE_ANALOG             0b11
 
 #ifdef __GNUC__
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
