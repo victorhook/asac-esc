@@ -13,8 +13,6 @@ C_SOURCES =  \
 src/main.c \
 src/hal.c \
 src/state.c \
-src/stm32c0xx_it.c \
-src/stm32c0xx_hal_msp.c \
 drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal.c \
 drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_adc.c \
 drivers/STM32C0xx_HAL_Driver/Src/stm32c0xx_hal_adc_ex.c \
