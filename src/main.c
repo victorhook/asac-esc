@@ -19,10 +19,10 @@ static inline void phase_low(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_por
 static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin, uint32_t adc_channel);
 
 
-#define LED_BLUE_HIGH() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_SET)
-#define LED_BLUE_LOW() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_RESET)
-#define LED_RED_HIGH() HAL_GPIO_WritePin(PORT_LED_BLUE, PIN_LED_BLUE, GPIO_PIN_SET)
-#define LED_RED_LOW() HAL_GPIO_WritePin(PORT_LED_BLUE, PIN_LED_BLUE, GPIO_PIN_RESET)
+#define LED_BLUE_HIGH() HAL_GPIO_WritePin(PORT_LED_BLUE, PIN_LED_BLUE, GPIO_PIN_SET)
+#define LED_BLUE_LOW() HAL_GPIO_WritePin(PORT_LED_BLUE, PIN_LED_BLUE, GPIO_PIN_RESET)
+#define LED_RED_HIGH() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_SET)
+#define LED_RED_LOW() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_RESET)
 
 // Slowest allowed signal is 50 Hz,
 #define NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US (20000 + 3000) // Add some margin
@@ -85,7 +85,6 @@ static inline void update()
         state._micros += (TIM14->CNT);
         TIM14->CNT = 0;
     }
-
 
     uint32_t now = micros();
 
@@ -161,13 +160,6 @@ static inline void update()
 
                     if (state.commutation_mode == COMMUTATION_OPEN_LOOP)
                     {
-                        state.throttle = state.open_loop_throttle;
-
-                        if (state.open_loop_commutation_period_us > 1600)
-                        {
-                            state.open_loop_commutation_period_us -= 2;
-                        }
-
                         now = micros();
 
                         // Check if we've done enough commutations in open-loop
@@ -203,7 +195,16 @@ static inline void update()
                         }
 
                         if (!state.next_commutation_time_set)
-                        {   // We'll set the next commutation to pre-decided time
+                        {
+                            state.throttle = state.open_loop_throttle;
+
+                            // Decrease the period a bit to make commutations faster
+                            if (state.open_loop_commutation_period_us > 1600)
+                            {
+                                state.open_loop_commutation_period_us -= 30;
+                            }
+
+                            // We'll set the next commutation to pre-decided time
                             state.next_commutation = now + state.open_loop_commutation_period_us;
                             state.next_commutation_time_set = true;
                             state.open_loop_commutations++;
@@ -455,7 +456,6 @@ static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, co
 
 void Error_Handler(void)
 {
-  __disable_irq();
   LED_BLUE_LOW();
   while (1)
   {
@@ -499,5 +499,5 @@ uint32_t micros()
 
 uint32_t millis()
 {
-  return micros() * 1000;
+  return micros() / 1000;
 }
