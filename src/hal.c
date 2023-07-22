@@ -299,6 +299,9 @@ static void adc_init()
 
     // Start!
     ADC1->CR |= ADC_CR_ADSTART;
+
+    // Calibrate
+    HAL_ADCEx_Calibration_Start(&hadc1);
 }
 
 static void nvic_interrupt_init()

@@ -21,12 +21,14 @@ state_t state = {
     .next_commutation_time_set       = false,
     .last_commutation_duration_us    = 0,
     .throttle                        = 0,
+    .direction                       = DIRECTION_FORWARD,
 
     // Open loop commutation params
-    .open_loop_throttle              = 1000,
+    .open_loop_throttle              = 700,
     .open_loop_delay_us_min          = 700,
     .open_loop_commutation_period_us = OPEN_LOOP_START_COMMUTATION_TIME_US,
-    .open_loop_max_commutations      = 600,
+    .open_loop_min_commutations      = 100,
+    .open_loop_max_commutations      = 200,
     .open_loop_commutations          = 0,
 
     // BEMF ADC

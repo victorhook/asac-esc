@@ -8,6 +8,11 @@
 
 #define OPEN_LOOP_START_COMMUTATION_TIME_US 5000
 
+typedef enum
+{
+    DIRECTION_FORWARD  = 1,
+    DIRECTION_REVERSED = -1
+} direction_t;
 
 typedef enum
 {
@@ -52,11 +57,13 @@ typedef struct
     bool               next_commutation_time_set;
     uint32_t           last_commutation_duration_us;
     uint16_t           throttle;
+    direction_t        direction;
 
     // Open loop commutation params
     uint16_t           open_loop_throttle;
     uint16_t           open_loop_delay_us_min;
     uint16_t           open_loop_commutation_period_us;
+    uint16_t           open_loop_min_commutations;
     uint16_t           open_loop_max_commutations;
     uint16_t           open_loop_commutations;
 
