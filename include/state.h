@@ -17,7 +17,8 @@ typedef enum
 typedef enum
 {
     MODE_IDLE,
-    MODE_RUNNING,
+    MODE_ARMING_SEQUENCE_STARTED,
+    MODE_ARMED,
 } state_mode_t;
 
 typedef enum

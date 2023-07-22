@@ -12,8 +12,8 @@ static inline void update();
 static uint32_t read_bemf();
 static inline void arm();
 static inline void disarm();
-static inline uint16_t pulse_length_to_throttle(const uint32_t time_since_last_pulse);
 static inline void commutate();
+static inline uint16_t pulse_length_to_throttle(const uint32_t time_since_last_pulse);
 static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, const uint8_t shift_mask);
 
 static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
@@ -51,7 +51,69 @@ static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_p
     phase_b_low();        \
     phase_c_low()
 
+// -- Audio -- //
+#define FREQ_A4 (float) 440.00
+#define FREQ_B4 (float) 493.88
+#define FREQ_C4 (float) 261.63
+#define FREQ_D4 (float) 293.66
+#define FREQ_E4 (float) 329.63
+#define FREQ_F4 (float) 349.23
+#define FREQ_G4 (float) 392.00
+
+const float TONE_A = (float) ((float) 1000000.0 / FREQ_A4);
+const float TONE_B = (float) ((float) 1000000.0 / FREQ_B4);
+const float TONE_C = (float) ((float) 1000000.0 / FREQ_C4);
+const float TONE_D = (float) ((float) 1000000.0 / FREQ_D4);
+const float TONE_E = (float) ((float) 1000000.0 / FREQ_E4);
+const float TONE_F = (float) ((float) 1000000.0 / FREQ_F4);
+const float TONE_G = (float) ((float) 1000000.0 / FREQ_G4);
+
+typedef struct
+{
+    float    tone;
+    uint32_t on_duration_ms;
+    uint32_t off_duration_ms;
+} note_t;
+
+void play_melody(const note_t notes[], const uint16_t nbr_of_notes);
+
+
+// TODO: Make this a setting?
+direction_t direction = DIRECTION_FORWARD;
+
 //#define DO_DEBUG
+#define DO_USE_AUDIO
+
+
+note_t startup_melody[] = {
+    {
+        .tone            = TONE_B,
+        .on_duration_ms  = 100,
+        .off_duration_ms = 100
+    },
+    {
+        .tone            = TONE_B,
+        .on_duration_ms  = 100,
+        .off_duration_ms = 100
+    },
+    {
+        .tone            = TONE_F,
+        .on_duration_ms  = 300,
+        .off_duration_ms = 0
+    }
+};
+
+note_t throttle_detected_note = {
+    .tone            = TONE_G,
+    .on_duration_ms  = 300,
+    .off_duration_ms = 300
+};
+
+note_t armed_note = {
+    .tone            = TONE_B,
+    .on_duration_ms  = 300,
+    .off_duration_ms = 300
+};
 
 
 int main()
@@ -65,41 +127,58 @@ int main()
 
     printf("Starting up...\n");
 
+    #ifdef DO_USE_AUDIO
+    play_melody(startup_melody, 3);
+    #endif
 
     while (1)
     {
         update_micros_timer();
-        uint32_t t0 = micros();
+        //uint32_t t0 = micros();
         update();
-        uint32_t t1 = micros();
-        uint32_t dt = t1 - t0;
-        //printf("DT: %u\n", dt);
+        //uint32_t t1 = micros();
+        //uint32_t dt = t1 - t0;
+        //printf("%d\n", dt);
+
+        #ifdef DO_DEBUG
+        static uint32_t t0 = 0;
+        if ((micros() - t0) > 1000000)
+        {
+            printf("%d, %d\n", state.commutation_mode, state.open_loop_commutations);
+            t0 = micros();
+        }
+        #endif
     }
 }
 
 static inline void update()
 {
-    uint32_t now;
-
-
-
-    now = micros();
-    long time_since_last_pulse = now - state.signal_last_ok_pulse;
-
-    #ifdef DO_DEBUG
-    static uint32_t t0 = 0;
-    if ((micros() - t0) > 1000000)
-    {
-        printf("%d, %d\n", state.commutation_mode, state.open_loop_commutations);
-        t0 = micros();
-    }
-    #endif
-
     state_mode_t next_mode;
+    uint32_t now = micros();
+
+    long time_since_last_pulse = now - state.signal_last_ok_pulse;
 
     if ((state.signal_last_ok_pulse > 0) && (time_since_last_pulse < NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US))
     {
-        next_mode = MODE_RUNNING;
+        switch (state.mode)
+        {
+            case MODE_IDLE:
+                // Starting from idle, let's start arming sequence
+                next_mode = MODE_ARMING_SEQUENCE_STARTED;
+                break;
+            case MODE_ARMING_SEQUENCE_STARTED:
+                if (state.throttle == 0)
+                {
+                    next_mode = MODE_ARMED;
+                }
+                else
+                {
+                    next_mode = MODE_ARMING_SEQUENCE_STARTED;
+                }
+                break;
+            default:
+                next_mode = MODE_ARMED;
+        }
     }
     else
     {
@@ -109,12 +188,20 @@ static inline void update()
     switch (state.mode)
     {
         case MODE_IDLE:
-            if (next_mode == MODE_RUNNING)
+            #ifdef DO_USE_AUDIO
+            if (next_mode == MODE_ARMING_SEQUENCE_STARTED)
+            {
+                play_melody(&throttle_detected_note, 1);
+            }
+            #endif
+            break;
+        case MODE_ARMING_SEQUENCE_STARTED:
+            if (next_mode == MODE_ARMED)
             {
                 arm();
             }
             break;
-        case MODE_RUNNING:
+        case MODE_ARMED:
             if (next_mode == MODE_IDLE)
             {
                 disarm();
@@ -291,7 +378,24 @@ static inline void commutate()
     }
 
     // Switch to next commutation state
-    state.bldc_state = (state.bldc_state + state.direction) % 6;
+    if (state.direction == DIRECTION_FORWARD)
+    {
+        state.bldc_state = (state.bldc_state + state.direction) % 6;
+    }
+    else
+    {
+        if (state.bldc_state == BLDC_STATE_1)
+        {
+            state.bldc_state = BLDC_STATE_6;
+        }
+        else
+        {
+            state.bldc_state--;
+        }
+        // In reverse direction, the bemf must also be considered, since the
+        // slopes will be reversed.
+        state.bemf_rising = !state.bemf_rising;
+    }
 
     // Update time since last transition
     uint32_t now = micros();
@@ -318,6 +422,14 @@ static inline void switch_to_open_loop()
     state.open_loop_commutations = 0;
     state.open_loop_commutation_period_us = OPEN_LOOP_START_COMMUTATION_TIME_US;
     state.open_loop_throttle = 500;
+
+    reset_commutation_state();
+}
+
+void reset_commutation_state()
+{
+    state.bldc_state = BLDC_STATE_1;
+    state.bemf_rising = false;
     all_outputs_low();
 }
 
@@ -388,14 +500,18 @@ static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_p
     state.input_adc_channel = adc_channel;
 }
 
-
 static inline void arm()
 {
+    #ifdef DO_USE_AUDIO
+    play_melody(&armed_note, 1);
+    #endif
+
     state.commutation_mode = COMMUTATION_OPEN_LOOP;
     state.open_loop_commutation_period_us = OPEN_LOOP_START_COMMUTATION_TIME_US;
     LED_RED_HIGH();
     printf("[%lu] ARM\n", millis());
 }
+
 static inline void disarm()
 {
     state.commutation_mode = COMMUTATION_OPEN_LOOP;
@@ -505,6 +621,47 @@ void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
     }
 }
 
+
+/*
+    Plays a single tone for a given amount of time.
+    Note that "tone" is really a value of: 1000000.0 / frequency
+*/
+static inline void play_tone(const float tone, const uint32_t duration_ms)
+{
+    uint32_t t0 = micros();
+    while ((micros() - t0) < (duration_ms * 1000))
+    {
+        // Disable interrupts, in case input signal interrupt occurs here and
+        // changes the throttle value.
+        disable_interrupts();
+        state.throttle = 750;
+        commutate();
+        enable_interrupts();
+        state.direction *= -1;
+        sleep_us(tone);
+    }
+}
+
+
+void play_melody(const note_t notes[], const uint16_t nbr_of_notes)
+{
+    // Save throttle and direction before we start, since we will alter them
+    uint16_t throttle = state.throttle;
+    direction_t direction = state.direction;
+
+    for (int i = 0; i < nbr_of_notes; i++)
+    {
+        note_t* note = &notes[i];
+        play_tone(note->tone, note->on_duration_ms);
+        sleep_ms(note->off_duration_ms);
+    }
+
+    // Restore throttle and diretions
+    state.throttle = throttle;
+    state.direction = direction;
+    reset_commutation_state();
+}
+
 uint32_t micros()
 {
   return state._micros + (TIM14->CNT);
@@ -513,4 +670,19 @@ uint32_t micros()
 uint32_t millis()
 {
   return micros() / 1000;
+}
+
+void sleep_us(const uint32_t delay_us)
+{
+    uint32_t t0 = micros();
+    while ((micros() - t0) < delay_us)
+    {
+        // Ensure we update microsecond timer while we wait.
+        update_micros_timer();
+    }
+}
+
+void sleep_ms(const uint32_t delay_ms)
+{
+    sleep_us(delay_ms * 1000);
 }
