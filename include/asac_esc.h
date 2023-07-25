@@ -19,7 +19,11 @@ inline void sleep_us(const uint32_t delay_us);
 
 inline void sleep_ms(const uint32_t delay_ms);
 
+inline void commutate();
+
 inline void reset_commutation_state();
+
+inline void all_outputs_low();
 
 #define HIN_A_MODER_SHIFT_MASK (1 * 2)  // PIN 1
 #define HIN_B_MODER_SHIFT_MASK (14 * 2) // PIN 14

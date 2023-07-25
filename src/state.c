@@ -20,15 +20,15 @@ state_t state = {
     .next_commutation                = 0,
     .next_commutation_time_set       = false,
     .last_commutation_duration_us    = 0,
+    .desired_throttle                = 0,
     .throttle                        = 0,
     .direction                       = DIRECTION_FORWARD,
 
     // Open loop commutation params
-    .open_loop_throttle              = 700,
+    .open_loop_throttle              = OPEN_LOOP_THROTTLE,
     .open_loop_delay_us_min          = 700,
     .open_loop_commutation_period_us = OPEN_LOOP_START_COMMUTATION_TIME_US,
-    .open_loop_min_commutations      = 100,
-    .open_loop_max_commutations      = 200,
+    .open_loop_min_commutations      = 30,
     .open_loop_commutations          = 0,
 
     // BEMF ADC
@@ -36,7 +36,7 @@ state_t state = {
     .highest_adc_value               = 0,
     .zero_crossing_point             = 0,
     .bemf_adc_filter_order           = 5,
-    .bemf_adc_filter                 = {0, 0, 0, 0, 0},
+    .bemf_adc_filter                 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 
     // MISC
     .pulse_errors                    = 0,

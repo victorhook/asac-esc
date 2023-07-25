@@ -1,5 +1,6 @@
 #include "asac_esc.h"
 #include "hal.h"
+#include "audio.h"
 
 // Callbacks
 void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin);
@@ -12,8 +13,9 @@ static inline void update();
 static uint32_t read_bemf();
 static inline void arm();
 static inline void disarm();
-static inline void commutate();
-static inline uint16_t pulse_length_to_throttle(const uint32_t time_since_last_pulse);
+
+/* Returns -1 if the pulse length is invalid */
+static inline int16_t pulse_length_to_throttle(const uint32_t time_since_last_pulse);
 static void inline set_gpio_mode(GPIO_TypeDef* gpio_port, const uint8_t mode, const uint8_t shift_mask);
 
 static inline void phase_high(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_port, uint16_t nlin_pin);
@@ -27,15 +29,29 @@ static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_p
 #define LED_RED_LOW() HAL_GPIO_WritePin(PORT_LED_RED, PIN_LED_RED, GPIO_PIN_RESET)
 
 // Slowest allowed signal is 50 Hz,
-#define NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US (20000 + 3000) // Add some margin
+#define NO_SIGNAL_RECEIVED_DISARM_TIMEOUT_US (20000 + 10000) // Add some margin
 
 #define MIN_PULSE_LENGTH_US 20
 #define MAX_PULSE_LENGTH_US 2500
 
-#define MINIMUM_PULSE_LENGTH_US 1000
-#define MAXIMUM_PULSE_LENGTH_US 2000
+#define MINIMUM_PULSE_LENGTH_PWM_US        1000
+#define MAXIMUM_PULSE_LENGTH_PWM_US        2000
+#define MINIMUM_PULSE_LENGTH_ONESHOT125_US 125
+#define MAXIMUM_PULSE_LENGTH_ONESHOT125_US 250
+#define MINIMUM_PULSE_LENGTH_ONESHOT42_US  42
+#define MAXIMUM_PULSE_LENGTH_ONESHOT42_US  84
+#define INVALID_PULSE_LENGTH               -1
+
+#define PWM_MIN_DETECTION_LIMIT     750
+#define ONESHOT_125_DETECTION_LIMIT 100
+#define ONESHOT_4_DETECTION_LIMIT   30
+
 #define MAX_THROTTLE_DUTY_VALUE 2048
-#define PULSE_LENGTH_TO_THROTTLE_FACTOR ((1.0 / (float) MINIMUM_PULSE_LENGTH_US) * MAX_THROTTLE_DUTY_VALUE)
+#define MIN_THROTTLE_DUTY_VALUE 400
+
+#define PULSE_LENGTH_TO_THROTTLE_FACTOR_PWM        ((1.0 / (float) MINIMUM_PULSE_LENGTH_PWM_US)        * (MAX_THROTTLE_DUTY_VALUE - MIN_THROTTLE_DUTY_VALUE))
+#define PULSE_LENGTH_TO_THROTTLE_FACTOR_ONESHOT125 ((1.0 / (float) MINIMUM_PULSE_LENGTH_ONESHOT125_US) * (MAX_THROTTLE_DUTY_VALUE - MIN_THROTTLE_DUTY_VALUE))
+#define PULSE_LENGTH_TO_THROTTLE_FACTOR_ONESHOT42  ((1.0 / (float) MINIMUM_PULSE_LENGTH_ONESHOT42_US)  * (MAX_THROTTLE_DUTY_VALUE - MIN_THROTTLE_DUTY_VALUE))
 
 #define phase_a_high()  phase_high( &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
 #define phase_a_low()   phase_low(  &PWM_REG_HIN_A, PORT_LIN_A, PIN_LIN_A)
@@ -46,37 +62,16 @@ static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_p
 #define phase_c_high()  phase_high( &PWM_REG_HIN_C, PORT_LIN_C, PIN_LIN_C)
 #define phase_c_low()   phase_low(  &PWM_REG_HIN_C, PORT_LIN_C, PIN_LIN_C)
 #define phase_c_input() phase_input(&PWM_REG_HIN_C, PORT_LIN_C, PIN_LIN_C, ADC_CHANNEL_PHASE_C)
-#define all_outputs_low() \
-    phase_a_low();        \
-    phase_b_low();        \
-    phase_c_low()
+
+
+void all_outputs_low()
+{
+    phase_a_low();
+    phase_b_low();
+    phase_c_low();
+}
 
 // -- Audio -- //
-#define FREQ_A4 (float) 440.00
-#define FREQ_B4 (float) 493.88
-#define FREQ_C4 (float) 261.63
-#define FREQ_D4 (float) 293.66
-#define FREQ_E4 (float) 329.63
-#define FREQ_F4 (float) 349.23
-#define FREQ_G4 (float) 392.00
-
-const float TONE_A = (float) ((float) 1000000.0 / FREQ_A4);
-const float TONE_B = (float) ((float) 1000000.0 / FREQ_B4);
-const float TONE_C = (float) ((float) 1000000.0 / FREQ_C4);
-const float TONE_D = (float) ((float) 1000000.0 / FREQ_D4);
-const float TONE_E = (float) ((float) 1000000.0 / FREQ_E4);
-const float TONE_F = (float) ((float) 1000000.0 / FREQ_F4);
-const float TONE_G = (float) ((float) 1000000.0 / FREQ_G4);
-
-typedef struct
-{
-    float    tone;
-    uint32_t on_duration_ms;
-    uint32_t off_duration_ms;
-} note_t;
-
-void play_melody(const note_t notes[], const uint16_t nbr_of_notes);
-
 
 // TODO: Make this a setting?
 direction_t direction = DIRECTION_FORWARD;
@@ -176,8 +171,12 @@ static inline void update()
                     next_mode = MODE_ARMING_SEQUENCE_STARTED;
                 }
                 break;
-            default:
+            case MODE_ARMED:
                 next_mode = MODE_ARMED;
+                break;
+            default:
+                // Should never reach this
+                next_mode = MODE_IDLE;
         }
     }
     else
@@ -232,7 +231,7 @@ static inline void update()
                         // Check if we've done enough commutations in open-loop
                         // mode and if we've detected a zero cross that seems
                         // to be reasonable.
-                        if ((state.open_loop_commutations > state.open_loop_max_commutations) &&
+                        if ((state.open_loop_commutations > state.open_loop_min_commutations) &&
                             (
                                 ((state.bemf_rising)  && (adc_value > state.zero_crossing_point)) ||
                                 ((!state.bemf_rising) && (adc_value < state.zero_crossing_point))
@@ -244,7 +243,7 @@ static inline void update()
                             uint32_t expected_zero_cross = state.last_commutation + (state.last_commutation_duration_us / 2);
 
                             const int offset_limit_plus = 100;
-                            const int offset_limit_minus = 100;
+                            const int offset_limit_minus = -100;
 
                             now = micros();
                             int dt = now - expected_zero_cross;
@@ -272,7 +271,7 @@ static inline void update()
                                 // Decrease the period a bit to make commutations faster
                                 if (state.open_loop_commutation_period_us > 1600)
                                 {
-                                    state.open_loop_commutation_period_us -= 30;
+                                    state.open_loop_commutation_period_us -= 100;
                                 }
 
                                 // We'll set the next commutation to pre-decided time
@@ -288,9 +287,7 @@ static inline void update()
                         // https://dspguru.com/dsp/faqs/fir/properties/
                         // Phase delay of filter: (N – 1) / (2 * Fs) = (5 - 1) / (2 * 60000) ≃ 33us
                         static const uint32_t phase_delay_us = 33;
-
-                        uint16_t loop_delay_us = 4;
-
+                        uint16_t loop_delay_us = 12;
 
                         if ( (!state.next_commutation_time_set) &&
                             (((state.bemf_rising)  && (adc_value > state.zero_crossing_point)) ||
@@ -320,7 +317,7 @@ static inline void update()
     state.mode = next_mode;
 }
 
-static inline void commutate()
+void commutate()
 {
     /*
         State   A   B   C
@@ -421,7 +418,7 @@ static inline void switch_to_open_loop()
     state.commutation_mode = COMMUTATION_OPEN_LOOP;
     state.open_loop_commutations = 0;
     state.open_loop_commutation_period_us = OPEN_LOOP_START_COMMUTATION_TIME_US;
-    state.open_loop_throttle = 500;
+    state.open_loop_throttle = OPEN_LOOP_THROTTLE;
 
     reset_commutation_state();
 }
@@ -477,17 +474,6 @@ static inline void phase_input(__IO uint32_t* pwm_comp_reg, GPIO_TypeDef* nlin_p
     // Set PWM on HIN to 0
     *pwm_comp_reg = 0;
 
-    // Select phase A as ADC channel.
-    // TODO: Quicker implementation with direct register manipulation.
-    /*
-    ADC_ChannelConfTypeDef sConfig = {
-        .Channel = adc_channel,
-        .Rank = ADC_REGULAR_RANK_1,
-        .SamplingTime = ADC_SAMPLINGTIME_COMMON_1
-    };
-    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-    */
-
     // Stop ADC
     ADC1->CR &= ~ADC_CR_ADSTART;
     // Set channel
@@ -522,26 +508,53 @@ static inline void disarm()
     printf("[%lu] DISARM\n", millis());
 }
 
-static inline uint16_t pulse_length_to_throttle(const uint32_t pulse_us)
+static inline int16_t pulse_length_to_throttle(const uint32_t pulse_us)
 {
-    float throttle;
+    uint32_t pulse;
+    uint16_t min;
+    float pulse_length_to_throttle_factor;
 
-    if (pulse_us < MINIMUM_PULSE_LENGTH_US)
-    {
-        throttle = MINIMUM_PULSE_LENGTH_US;
+    /*
+        We support the following pulse lengths:
+            - 1000-2000 us - Normal 50 Hz PWM
+            - 125-250 us - Oneshot 125
+            - 42-84 us - Oneshot 42
+    */
+
+    if (pulse_us > PWM_MIN_DETECTION_LIMIT)
+    {    // PWM
+        pulse = constrain(pulse_us, MINIMUM_PULSE_LENGTH_PWM_US, MAXIMUM_PULSE_LENGTH_PWM_US);
+        pulse_length_to_throttle_factor = PULSE_LENGTH_TO_THROTTLE_FACTOR_PWM;
+        min = MINIMUM_PULSE_LENGTH_PWM_US;
     }
-    else if (pulse_us > MAXIMUM_PULSE_LENGTH_US)
+    else if (pulse_us > ONESHOT_125_DETECTION_LIMIT)
+    {    // Oneshot 125
+        pulse = constrain(pulse_us, MINIMUM_PULSE_LENGTH_ONESHOT125_US, MAXIMUM_PULSE_LENGTH_ONESHOT125_US);
+        pulse_length_to_throttle_factor = PULSE_LENGTH_TO_THROTTLE_FACTOR_ONESHOT125;
+        min = MINIMUM_PULSE_LENGTH_ONESHOT125_US;
+    }
+    else if (pulse_us > ONESHOT_4_DETECTION_LIMIT)
+    {    // Oneshot 42
+        pulse = constrain(pulse_us, MINIMUM_PULSE_LENGTH_ONESHOT42_US, MAXIMUM_PULSE_LENGTH_ONESHOT42_US);
+        pulse_length_to_throttle_factor = PULSE_LENGTH_TO_THROTTLE_FACTOR_ONESHOT42;
+        min = MINIMUM_PULSE_LENGTH_ONESHOT42_US;
+    }
+    else
+    {    // Unknown??
+        return -1;
+    }
+
+    // This ensures that as long as there is a desired throttle above 0, it's
+    // going to be at least MIN_THROTTLE_DUTY_VALUE. This is because bldc motors
+    // are typically very hard to spin at low speeds.
+    if (pulse > min)
     {
-        throttle = MAXIMUM_PULSE_LENGTH_US;
+        return MIN_THROTTLE_DUTY_VALUE + ((uint16_t) ((pulse - min) * pulse_length_to_throttle_factor));
     }
     else
     {
-        throttle = pulse_us;
+        return 0;
     }
-
-    throttle -= MINIMUM_PULSE_LENGTH_US;
-
-    return (uint16_t) (throttle * PULSE_LENGTH_TO_THROTTLE_FACTOR);
 }
 
 static void blink_boot_up_sequence()
@@ -588,10 +601,14 @@ void Error_Handler(void)
 
 void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 {
+    disable_interrupts();
     state.signal_last_high_us = micros();
+    enable_interrupts();
 }
+
 void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
 {
+    disable_interrupts();
     state.signal_last_low_us = micros();
 
     uint32_t signal_pulse_length_us = state.signal_last_low_us - state.signal_last_high_us;
@@ -612,54 +629,24 @@ void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
         // update the throttle value
         if (state.signal_pulse_length_us != state.signal_last_pulse_length_us)
         {   // New pulse received, calculate throttle
-            state.throttle = pulse_length_to_throttle(state.signal_last_pulse_length_us);
+            int16_t new_throttle = pulse_length_to_throttle(state.signal_last_pulse_length_us);
+            if (new_throttle != INVALID_PULSE_LENGTH)
+            {
+                // New throttle value set
+                state.throttle = new_throttle;
+            }
+            else
+            {
+                // Pulse length invalid!
+                state.pulse_errors++;
+            }
         }
     }
     else
     {
         state.pulse_errors++;
     }
-}
-
-
-/*
-    Plays a single tone for a given amount of time.
-    Note that "tone" is really a value of: 1000000.0 / frequency
-*/
-static inline void play_tone(const float tone, const uint32_t duration_ms)
-{
-    uint32_t t0 = micros();
-    while ((micros() - t0) < (duration_ms * 1000))
-    {
-        // Disable interrupts, in case input signal interrupt occurs here and
-        // changes the throttle value.
-        disable_interrupts();
-        state.throttle = 750;
-        commutate();
-        enable_interrupts();
-        state.direction *= -1;
-        sleep_us(tone);
-    }
-}
-
-
-void play_melody(const note_t notes[], const uint16_t nbr_of_notes)
-{
-    // Save throttle and direction before we start, since we will alter them
-    uint16_t throttle = state.throttle;
-    direction_t direction = state.direction;
-
-    for (int i = 0; i < nbr_of_notes; i++)
-    {
-        note_t* note = &notes[i];
-        play_tone(note->tone, note->on_duration_ms);
-        sleep_ms(note->off_duration_ms);
-    }
-
-    // Restore throttle and diretions
-    state.throttle = throttle;
-    state.direction = direction;
-    reset_commutation_state();
+    enable_interrupts();
 }
 
 uint32_t micros()

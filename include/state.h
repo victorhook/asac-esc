@@ -6,7 +6,8 @@
 
 
 
-#define OPEN_LOOP_START_COMMUTATION_TIME_US 5000
+#define OPEN_LOOP_START_COMMUTATION_TIME_US 4000
+#define OPEN_LOOP_THROTTLE                  500
 
 typedef enum
 {
@@ -57,6 +58,7 @@ typedef struct
     uint32_t           next_commutation;
     bool               next_commutation_time_set;
     uint32_t           last_commutation_duration_us;
+    uint16_t           desired_throttle;
     uint16_t           throttle;
     direction_t        direction;
 
@@ -65,7 +67,7 @@ typedef struct
     uint16_t           open_loop_delay_us_min;
     uint16_t           open_loop_commutation_period_us;
     uint16_t           open_loop_min_commutations;
-    uint16_t           open_loop_max_commutations;
+
     uint16_t           open_loop_commutations;
 
     // BEMF ADC
@@ -73,7 +75,7 @@ typedef struct
     uint32_t           highest_adc_value;
     uint32_t           zero_crossing_point;
     uint32_t           bemf_adc_filter_order;
-    uint32_t           bemf_adc_filter[5];
+    uint32_t           bemf_adc_filter[10];
 
     // MISC
     uint32_t           pulse_errors;
